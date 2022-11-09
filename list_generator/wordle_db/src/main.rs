@@ -1,17 +1,22 @@
 use std::io;
-use std::io::{prelude::*, BufReader};
 use std::vec::Vec;
-use std::net::{TcpListener, TcpStream};
+use serde::{Deserialize, Serialize};
+use serde_json::{Result, Value};
+use std::fs::File;
+use std::io::Write;
 
-#[derive(Clone, Debug)]
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Row {
     date: String,
     number: u32,
     word: String,
     url: String,
+    epoch: i64,
 }
 
-fn example() -> Vec<Row> {
+// Depecrated
+/*fn example() -> Vec<Row> {
     // Build the CSV reader and iterate over each record.
     let mut rdr = csv::Reader::from_reader(io::stdin());
     let mut rows: Vec<Row> = Vec::new();
@@ -34,9 +39,9 @@ fn example() -> Vec<Row> {
     }
 
     return rows;
-}
+}*/
 
-fn get_by_date(rows: &Vec<Row>, date: &str) -> Row {
+/*fn get_by_date(rows: &Vec<Row>, date: &str) -> Row {
     for row in rows {
         if row.date == date {
             return row.clone();
@@ -44,41 +49,96 @@ fn get_by_date(rows: &Vec<Row>, date: &str) -> Row {
     }
 
     panic!("No row found for date {}", date);
-}
+}*/
 
-fn get_today(rows: &Vec<Row>) -> Row {
+/*fn get_today(rows: &Vec<Row>) -> Row {
     let today = chrono::Local::today().format("%Y-%m-%d").to_string();
     return get_by_date(rows, &today);
+}*/
+
+fn get_row_from_json_str(json_str: &str) -> Result<Row> {
+    let v: Value = serde_json::from_str(json_str)?;
+    let date = v["print_date"].as_str().unwrap().to_string();
+    let number = v["days_since_launch"].as_u64().unwrap() as u32;
+    let word = v["solution"].as_str().unwrap().to_string();
+    let mut url = "https://www.nytimes.com/svc/wordle/v2/".to_owned();
+    url.push_str(date.clone().as_str());
+    url.push_str(".json");
+
+    let parsed_date = chrono::NaiveDate::parse_from_str(date.as_str(), "%Y-%m-%d").unwrap();
+    let epoch = parsed_date.and_hms(8, 0, 0).timestamp();
+
+    return Ok(Row {
+        date: date,
+        number: number,
+        word: word,
+        url: url,
+        epoch: epoch,
+    });
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&mut stream);
-    let http_request: Vec<_> = buf_reader
-        .lines()
-        .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
-
-    println!("Request: {:#?}", http_request);
-
-    let response = "HTTP/1.1 200 OK\r\n\r\n";
-    stream.write(response.as_bytes()).unwrap();
+fn output_vec_to_json(rows: &Vec<Row>, filename: &str) {
+    let mut file = std::fs::File::create(filename).unwrap();
+    let json = serde_json::to_string_pretty(rows).unwrap();
+    file.write_all(json.as_bytes()).unwrap();
 }
 
-fn main() {
-    let row_vec = example();
+async fn fill_vec(row_vec: &mut Vec<Row>) {
+    let mut curr_date = chrono::Local::today();
+    let curr_epoch = curr_date.and_hms(0, 0, 0).timestamp();
+    println!("Current epoch: {}", curr_epoch);
 
-    let sel_row = get_by_date(&row_vec, "2022-11-07");
-    let today_row = get_today(&row_vec);
+    loop {
+        let curr_date_str = curr_date.format("%Y-%m-%d").to_string();
+        let url = format!("https://www.nytimes.com/svc/wordle/v2/{curr_date_str}.json");
+        let response = reqwest::get(url).await.unwrap();
 
-    println!("Selected row: {:?}", sel_row);
-    println!("Today's row: {:?}", today_row);
+        if !response.status().is_success() {
+            if response.status().as_u16() == 404 {
+                println!("404 for {}", curr_date_str);
+                break;
+            } else {
+                // We are likely being ratelimited, wait a couple of seconds
+                println!("Ratelimited, waiting 2 seconds...");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                println!("Resumed...");
+                continue;
+            }
+        }
 
-    let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
-    
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
-        println!("Connection established!");
-        handle_connection(stream);
+        println!("Got status code {} for {}.", response.status().as_u16(), curr_date_str);
+
+        let text = response.text().await.unwrap();
+        let row = get_row_from_json_str(&text).unwrap();
+
+        row_vec.push(row);
+        //println!("{:?}", row_vec.last().unwrap());
+        curr_date += chrono::Duration::days(1);
     }
+}
+
+fn output_to_js(rows: &Vec<Row>, filename: &str) {
+    let mut file = std::fs::File::create(filename).unwrap();
+    let mut js = "let answerList = ".to_owned();
+    let json = serde_json::to_string_pretty(rows).unwrap();
+    js.push_str(json.as_str());
+    file.write_all(js.as_bytes()).unwrap();
+}
+
+fn get_vec_from_json(filename: &str) -> Vec<Row> {
+    let file = File::open(filename).unwrap();
+    let reader = std::io::BufReader::new(file);
+    let rows: Vec<Row> = serde_json::from_reader(reader).unwrap();
+
+    return rows;
+}
+
+#[tokio::main]
+async fn main() {
+    // let mut row_vec: Vec<Row> = Vec::new();
+    // fill_vec(&mut row_vec).await;
+    // output_vec_to_json(&row_vec, "output.json");
+
+    let row_vec = get_vec_from_json("output.json");
+    output_to_js(&row_vec, "answerList.js");
 }
